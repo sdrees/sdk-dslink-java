@@ -75,7 +75,9 @@ public class DefaultWsProvider extends WsProvider {
                 p.addLast(new HttpObjectAggregator(8192));
                 WebSocketClientExtensionHandshaker com
                         = new PerMessageDeflateClientExtensionHandshaker();
-                p.addLast(new WebSocketClientExtensionHandler(com));
+                if (getUseCompression()) {
+                    p.addLast(new WebSocketClientExtensionHandler(com));
+                }
                 p.addLast(handler);
             }
         });
@@ -111,7 +113,13 @@ public class DefaultWsProvider extends WsProvider {
                                  Object msg) {
             final Channel ch = ctx.channel();
             if (handshake != null && !handshake.isHandshakeComplete()) {
-                handshake.finishHandshake(ch, (FullHttpResponse) msg);
+                try {
+                    handshake.finishHandshake(ch, (FullHttpResponse) msg);
+                } catch (Throwable throwable) {
+                    client.onThrowable(throwable);
+                    throw throwable;
+                }
+
                 handshake = null;
                 client.onConnected(new NetworkClient() {
 
@@ -126,9 +134,7 @@ public class DefaultWsProvider extends WsProvider {
                         byte[] bytes = data.encode(format);
                         ByteBuf buf = Unpooled.wrappedBuffer(bytes);
                         WebSocketFrame frame = null;
-                        if (format == EncodingFormat.MESSAGE_PACK) {
-                            frame = new BinaryWebSocketFrame(buf);
-                        } else if (format == EncodingFormat.JSON) {
+                        if (format == EncodingFormat.JSON) {
                             frame = new TextWebSocketFrame(buf);
                         } else {
                             String err = "Unsupported encoding format: {}";

@@ -35,7 +35,13 @@ public class GetHistory implements Handler<ActionResult> {
     private final String path;
 
     public GetHistory(Node node, Database db) {
-        this.path = node.getName().replaceAll("%2F", "/").replaceAll("%2E", ".");
+        Value useNewEncodingMethod = node.getConfig(Watch.USE_NEW_ENCODING_METHOD_CONFIG_NAME);
+        if (useNewEncodingMethod == null || !useNewEncodingMethod.getBool()) {
+            this.path = node.getName().replaceAll("%2F", "/").replaceAll("%2E", ".");
+        } else {
+            this.path = StringUtils.decodeName(node.getName());
+        }
+
         this.db = db;
     }
 
@@ -80,7 +86,8 @@ public class GetHistory implements Handler<ActionResult> {
                            final boolean realTime,
                            final Rollup.Type rollup,
                            final IntervalParser parser) {
-        final IntervalProcessor interval = IntervalProcessor.parse(parser, rollup);
+        final IntervalProcessor interval = IntervalProcessor.parse(
+                parser, rollup, from.getTimeZone());
         LoopProvider.getProvider().schedule(new Runnable() {
 
             private boolean open = true;
@@ -194,6 +201,10 @@ public class GetHistory implements Handler<ActionResult> {
             }
         }
         if (batch != null) {
+            // If we can't get a stream open to the requester, then there's a chance batch rows
+            // could eventually cause an out of memory situation.  So fail the invocation after a
+            // minute of not getting a response.
+            table.waitForStream(60000, true);
             table.addBatchRows(batch);
         }
     }

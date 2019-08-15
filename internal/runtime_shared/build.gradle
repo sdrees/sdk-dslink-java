@@ -1,22 +1,13 @@
-apply from: '../../sdk/build.gradle'
+apply from: '../../bintray.gradle'
+
+description = 'Shared Runtime for the SDK'
 
 dependencies {
-    compile 'com.fasterxml.jackson.core:jackson-core:2.6.2'
-    compile 'org.msgpack:jackson-dataformat-msgpack:0.7.1'
-    compile 'org.bouncycastle:bcprov-jdk15on:1.51'
-    compile 'io.netty:netty-all:4.1.0.CR2'
-    compile 'com.beust:jcommander:1.48'
-    compile 'com.jcraft:jzlib:1.1.3'
-}
-
-uploadArchives {
-    repositories {
-        mavenDeployer {
-            pom.project {
-                name = 'DSLink Shared Runtime'
-                artifactId = 'runtime_shared'
-                description = 'Shared Runtime for the SDK'
-            }
-        }
-    }
+    api 'org.bouncycastle:bcprov-jdk15on:1.62'
+    api 'io.netty:netty-all:4.1.38.Final'
+    api 'com.beust:jcommander:1.72'
+    api 'org.msgpack:jackson-dataformat-msgpack:0.8.17'
+    //the following overrides the dependency in jackson-dataformat-msgpack
+    //and can be removed once msgpack catches up to 2.9.9.3
+    api 'com.fasterxml.jackson.core:jackson-databind:2.9.9.3'
 }

@@ -58,6 +58,8 @@ public class Node {
     private Set<String> interfaces;
     private Action action;
     private char[] pass;
+    
+    private boolean shouldPostCachedValue = true;
 
     /**
      * Constructs a node object.
@@ -67,10 +69,16 @@ public class Node {
      * @param link Linkable class the node is handled on
      */
     public Node(String name, Node parent, Linkable link) {
+        this(name, parent, link, true);
+    }
+
+    public Node(String name, Node parent, Linkable link, boolean shouldEncodeName) {
         this.parent = new WeakReference<>(parent);
         this.listener = new NodeListener(this);
         this.link = link;
-        name = StringUtils.encodeName(name);
+        if (shouldEncodeName) {
+            name = StringUtils.encodeName(name);
+        }
         if (name == null) {
             throw new IllegalArgumentException("name");
         }
@@ -181,6 +189,7 @@ public class Node {
             throw new NullPointerException("listener");
         }
         this.listener = listener;
+        listener.setNode(this);
     }
 
     public void addInterface(String _interface) {
@@ -245,6 +254,20 @@ public class Node {
                             boolean externalSource,
                             boolean publish) {
         ValueType type = valueType;
+        if (type == null) {
+            if (this.value != null) {
+                type = this.value.getType();
+                if (type != null) {
+                    setValueType(type);
+                }
+            }
+            if ((type == null) && (value != null)) {
+                type = value.getType();
+                if (type != null) {
+                    setValueType(type);
+                }
+            }
+        }
         if (type == null && value != null) {
             String err = "Value type not set on node (" + getPath() + ")";
             throw new RuntimeException(err);
@@ -349,6 +372,24 @@ public class Node {
     public Writable getWritable() {
         return writable;
     }
+    
+    /**
+     * @return Whether the node's value should automatically 
+     *         be posted in response to a subscription request.
+     */
+    public boolean shouldPostCachedValue() {
+    	return shouldPostCachedValue;
+    }
+
+    /**
+     * @param should Whether the node's value should 
+     *               automatically be posted in response to a 
+     *               subscription request. Defaults to true.
+     */
+    public void setShouldPostCachedValue(boolean should) {
+    	shouldPostCachedValue = should;
+    }
+    
 
     /**
      * @return Children of the node, can be null
@@ -378,10 +419,22 @@ public class Node {
      * @param name Child name
      * @return Child, or null if non-existent
      */
+    @Deprecated
     public Node getChild(String name) {
         Map<String, Node> children = this.children;
         if (children != null) {
             name = StringUtils.encodeName(name);
+            return children.get(name);
+        }
+        return null;
+    }
+
+    public Node getChild(String name, boolean encodeName) {
+        Map<String, Node> children = this.children;
+        if (children != null) {
+            if (encodeName) {
+                name = StringUtils.encodeName(name);
+            }
             return children.get(name);
         }
         return null;
@@ -394,10 +447,14 @@ public class Node {
      * @param name Name of the child
      * @return builder
      */
+    @Deprecated
     public NodeBuilder createChild(String name) {
         return createChild(name, profile);
     }
 
+    public NodeBuilder createChild(String name, boolean encodeName) {
+        return createChild(name, profile, encodeName);
+    }
     /**
      * Creates a node builder to allow setting up the node data before
      * any list subscriptions can be notified.
@@ -415,6 +472,16 @@ public class Node {
         return b;
     }
 
+    public NodeBuilder createChild(String name, String profile, boolean encodeName) {
+        NodeBuilder b = new NodeBuilder(this, new Node(name, this, link, encodeName));
+
+        if (profile != null) {
+            b.setProfile(profile);
+        }
+
+        return b;
+    }
+
     /**
      * The child will be added if the node doesn't exist. If the child
      * already exists then it will be returned and no new node will be
@@ -426,9 +493,8 @@ public class Node {
     public Node addChild(Node node) {
         synchronized (childrenLock) {
             String name = node.getName();
-            if (children == null) {
-                children = new ConcurrentHashMap<>();
-            } else if (children.containsKey(name)) {
+            maybeInitializeChildren();
+            if (children.containsKey(name)) {
                 return children.get(name);
             }
 
@@ -452,8 +518,58 @@ public class Node {
     }
 
     /**
+     * Add multiple children at once.
+     * @param nodes Nodes to add.
+     */
+    public void addChildren(List<Node> nodes) {
+        SubscriptionManager manager = null;
+        if (link != null) {
+            manager = link.getSubscriptionManager();
+        }
+        boolean reserialize = false;
+
+        synchronized (childrenLock) {
+            for (Node node : nodes) {
+                String name = node.getName();
+                maybeInitializeChildren();
+                if (children.containsKey(name)) {
+                    continue;
+                }
+
+                node.maybeInitializeProfile(profile);
+                children.put(name, node);
+
+                if (node.isSerializable()) {
+                    reserialize = true;
+                }
+            }
+        }
+
+        if (manager != null) {
+            manager.postMultiChildUpdate(this, nodes);
+        }
+
+        if (reserialize) {
+            markChanged();
+        }
+    }
+
+    private void maybeInitializeProfile(String profile) {
+        if (getProfile() == null) {
+            setProfile(profile);
+        }
+    }
+
+    private void maybeInitializeChildren() {
+        if (children == null) {
+            children = new ConcurrentHashMap<>();
+        }
+    }
+
+    /**
      * Deletes this node from its parent.
      */
+    @Deprecated
     public void delete() {
         Node parent = getParent();
         if (parent != null) {
@@ -461,13 +577,29 @@ public class Node {
         }
     }
 
+    public void delete(boolean encodeName) {
+        Node parent = getParent();
+        if (parent != null) {
+            parent.removeChild(this, encodeName);
+        }
+    }
+
     /**
      * @param node Node to remove.
      * @return The node if it existed.
      */
+    @Deprecated
     public Node removeChild(Node node) {
         if (node != null) {
             return removeChild(node.getName());
+        } else {
+            return null;
+        }
+    }
+
+    public Node removeChild(Node node, boolean encodeName) {
+        if (node != null) {
+            return removeChild(node.getName(), encodeName);
         } else {
             return null;
         }
@@ -477,9 +609,16 @@ public class Node {
      * @param name Node to remove.
      * @return The node if it existed.
      */
+    @Deprecated
     public Node removeChild(String name) {
+        return removeChild(name, true);
+    }
+
+    public Node removeChild(String name, boolean encodeName) {
         synchronized (childrenLock) {
-            name = StringUtils.encodeName(name);
+            if (encodeName) {
+                name = StringUtils.encodeName(name);
+            }
             Node child = children != null ? children.remove(name) : null;
             SubscriptionManager manager = null;
             if (link != null) {
@@ -487,7 +626,9 @@ public class Node {
             }
 
             if (child != null) {
+                child.getListener().postNodeRemoved();
                 child.getListener().kill();
+
                 if (manager != null) {
                     manager.postChildUpdate(child, true);
                     manager.removeValueSub(child);
@@ -505,10 +646,22 @@ public class Node {
      * @param name Name of the child.
      * @return Whether this node has the child or not.
      */
+    @Deprecated
     public boolean hasChild(String name) {
         Map<String, Node> children = this.children;
         if (children != null) {
             name = StringUtils.encodeName(name);
+            return children.containsKey(name);
+        }
+        return false;
+    }
+
+    public boolean hasChild(String name, boolean encodeName) {
+        Map<String, Node> children = this.children;
+        if (children != null) {
+            if (encodeName) {
+                name = StringUtils.encodeName(name);
+            }
             return children.containsKey(name);
         }
         return false;

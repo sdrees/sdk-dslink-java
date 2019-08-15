@@ -1,24 +1,19 @@
 package org.dsa.iot.historian.database;
 
-import org.dsa.iot.dslink.DSLink;
-import org.dsa.iot.dslink.DSLinkHandler;
-import org.dsa.iot.dslink.DSLinkProvider;
-import org.dsa.iot.dslink.link.Requester;
-import org.dsa.iot.dslink.methods.requests.SetRequest;
 import org.dsa.iot.dslink.node.Node;
 import org.dsa.iot.dslink.node.NodeBuilder;
 import org.dsa.iot.dslink.node.Permission;
 import org.dsa.iot.dslink.node.actions.Action;
 import org.dsa.iot.dslink.node.actions.ActionResult;
 import org.dsa.iot.dslink.node.actions.Parameter;
+import org.dsa.iot.dslink.node.actions.ResultType;
+import org.dsa.iot.dslink.node.actions.table.Row;
 import org.dsa.iot.dslink.node.value.SubscriptionValue;
 import org.dsa.iot.dslink.node.value.Value;
 import org.dsa.iot.dslink.node.value.ValueType;
 import org.dsa.iot.dslink.provider.LoopProvider;
 import org.dsa.iot.dslink.util.StringUtils;
 import org.dsa.iot.dslink.util.handler.Handler;
-import org.dsa.iot.dslink.util.json.JsonArray;
-import org.dsa.iot.dslink.util.json.JsonObject;
 import org.dsa.iot.historian.utils.QueryData;
 import org.dsa.iot.historian.utils.WatchUpdate;
 
@@ -33,17 +28,17 @@ public class WatchGroup {
     private static final long DEFAULT_INTERVAL_IN_SECONDS = 5;
     private static final int DEFAULT_BUFFER_FLUSH_TIME_IN_SECONDS = 5;
     private static final LoggingType DEFAULT_LOGGING_TYPE = LoggingType.ALL_DATA;
+    private static int AVAILABLE_PROCESSORS = Runtime.getRuntime().availableProcessors();
+    private static final ScheduledExecutorService INTERVAL_SCHEDULER = Executors.newScheduledThreadPool(Math.min(MINIMUM_AMOUNT_OF_THREADS, AVAILABLE_PROCESSORS));
 
     private final Permission permission;
     private final Database db;
     private final Node node;
-
     private final Queue<WatchUpdate> queue = new ConcurrentLinkedDeque<>();
     private final Object writeLoopLock = new Object();
-    private final ScheduledExecutorService intervalScheduler;
+    private final List<Watch> watches = new ArrayList<>();
 
     private ScheduledFuture<?> bufferFut;
-    private List<Watch> watches = new ArrayList<>();
     private ScheduledFuture<?> scheduledIntervalWriter;
     private LoggingType loggingType = DEFAULT_LOGGING_TYPE;
     private long interval = DEFAULT_INTERVAL_IN_SECONDS;
@@ -58,15 +53,10 @@ public class WatchGroup {
         this.permission = perm;
         this.node = node;
         this.db = db;
-
-        int availableProcessors = Runtime.getRuntime().availableProcessors();
-        intervalScheduler = Executors.newScheduledThreadPool(Math.min(MINIMUM_AMOUNT_OF_THREADS, availableProcessors));
     }
 
     public void close() {
-        if (bufferFut != null) {
-            bufferFut.cancel(true);
-        }
+        cancelIntervalScheduler();
     }
 
     /**
@@ -104,18 +94,6 @@ public class WatchGroup {
                 }
                 break;
             }
-            case POINT_TIME: {
-                Value vCurr = watch.getLastValue();
-                Value vUpdate = sv.getValue();
-                long curr = (vCurr == null) ? 0 : vCurr.getTime();
-                long update = (vUpdate == null) ? 0 : vUpdate.getTime();
-
-                if ((vCurr != null) && (curr < update)) {
-                    doWrite = true;
-                    watch.setLastValue(vUpdate);
-                }
-                break;
-            }
         }
 
         if (doWrite) {
@@ -131,16 +109,15 @@ public class WatchGroup {
         }
     }
 
-    private void writeWatchesToBuffer() {
+    private void writeWatchesToBuffer(Date nowTimestamp) {
         for (Watch watch : watches) {
             if (!watch.isEnabled()) {
-               continue;
+                continue;
             }
 
             WatchUpdate update = watch.getLastWatchUpdate();
-
             if (update != null) {
-                addWatchUpdateToBuffer(update);
+                addWatchUpdateToBuffer(update, nowTimestamp);
             }
         }
     }
@@ -149,21 +126,21 @@ public class WatchGroup {
      * Initializes the watch for the group.
      *
      * @param path Watch path.
+     * @param useNewEncodingMethod Tells if the link uses the old way of encoding paths.
      */
-    protected void initWatch(String path) {
-        Watch watch;
-        {
-            NodeBuilder b = node.createChild(path);
-            b.setValueType(ValueType.DYNAMIC);
-            b.setValue(null);
-            Node n = b.build();
-            watch = new Watch(this, n);
-            watch.init(permission);
-            n.setMetaData(watch);
-            db.getProvider().onWatchAdded(watch);
-        }
+    protected void initWatch(String path, boolean useNewEncodingMethod) {
+        NodeBuilder b = node.createChild(path);
+        b.setValueType(ValueType.DYNAMIC);
+        b.setValue(null);
+        b.setConfig("useNewEncodingMethod", new Value(useNewEncodingMethod));
+        Node n = b.build();
+        Watch watch = new Watch(this, n);
+        watch.init(permission, db);
+        n.setMetaData(watch);
+        db.getProvider().onWatchAdded(watch);
 
         scheduleWriteToBuffer();
+        scheduleBufferFlush();
     }
 
     private void scheduleWriteToBuffer() {
@@ -172,13 +149,19 @@ public class WatchGroup {
         }
 
         if (scheduledIntervalWriter == null || scheduledIntervalWriter.isDone()) {
-            scheduledIntervalWriter = intervalScheduler.scheduleAtFixedRate(new Runnable() {
+            long now = new Date().getTime();
+            long initialDelayBeforeLogging = findInitialDelayOfLogging(now);
+            scheduledIntervalWriter = INTERVAL_SCHEDULER.scheduleAtFixedRate(new Runnable() {
                 @Override
                 public void run() {
-                    writeWatchesToBuffer();
+                    writeWatchesToBuffer(new Date());
                 }
-            }, 0, interval, TimeUnit.SECONDS);
+            }, initialDelayBeforeLogging, interval * 1000, TimeUnit.MILLISECONDS);
         }
+    }
+
+    private long findInitialDelayOfLogging(long now) {
+        return interval * 1000 - now % (interval * 1000);
     }
 
     /**
@@ -188,12 +171,36 @@ public class WatchGroup {
         Map<String, Node> children = node.getChildren();
         for (Node n : children.values()) {
             if (n.getAction() == null) {
-                initWatch(n.getName().replaceAll("%2F", "/").replaceAll("%2E", "."));
+                Value useNewEncodingMethod = n.getConfig(Watch.USE_NEW_ENCODING_METHOD_CONFIG_NAME);
+                if (useNewEncodingMethod == null || !useNewEncodingMethod.getBool()) {
+                    String path = n.getName().replaceAll("%2F", "/").replaceAll("%2E", ".");
+                    // JTH: This was added to prevent watches to be re-added
+                    // disconnection/reconnection.
+                    if (containsWatch(path)) {
+                        continue;
+                    }
+
+                    initWatch(path, false);
+                } else {
+                    String path = StringUtils.decodeName(n.getName());
+                    if (containsWatch(path)) {
+                        continue;
+                    }
+
+                    initWatch(path, true);
+                }
+            }
+        }
+    }
+
+    private boolean containsWatch(String path) {
+        for (Watch watch : watches) {
+            if (watch.getPath().equals(path)) {
+                return true;
             }
         }
 
-        scheduleWriteToBuffer();
-        scheduleBufferFlush();
+        return false;
     }
 
     /**
@@ -215,126 +222,10 @@ public class WatchGroup {
     protected void initSettings() {
         useExistingValuesForEditAction();
 
-        {
-            NodeBuilder b = node.createChild("addWatchPath");
-            b.setDisplayName("Add Watch Path");
-            {
-                Action a = new Action(permission, new Handler<ActionResult>() {
-                    @Override
-                    public void handle(ActionResult event) {
-                        ValueType vt = ValueType.STRING;
-                        Value v = event.getParameter("Path", vt);
-                        String path = v.getString();
-                        initWatch(path);
-
-                        JsonObject obj = new JsonObject();
-                        obj.put("@", "merge");
-                        obj.put("type", "paths");
-
-                        String p = node.getLink().getDSLink().getPath();
-                        p += node.getPath() + "/";
-                        p += StringUtils.encodeName(path) + "/getHistory";
-                        JsonArray array = new JsonArray();
-                        array.add(p);
-                        obj.put("val", array);
-                        v = new Value(obj);
-
-                        DSLinkHandler h = node.getLink().getHandler();
-                        DSLinkProvider pr = h.getProvider();
-                        String dsId = h.getConfig().getDsIdWithHash();
-                        DSLink link = pr.getRequesters().get(dsId);
-                        Requester req = link.getRequester();
-                        path += "/@@getHistory";
-                        req.set(new SetRequest(path, v), null);
-                    }
-                });
-                {
-                    Parameter p = new Parameter("Path", ValueType.STRING);
-                    p.setDescription("Path to start watching for value changes");
-                    a.addParameter(p);
-                }
-                b.setAction(a);
-            }
-            b.build();
-        }
-        {
-            NodeBuilder b = node.createChild("edit");
-            b.setDisplayName("Edit");
-            // Buffer flush time
-            b.setRoConfig("bft", new Value(bufferFlushTime));
-            // Logging type
-            b.setRoConfig("lt", new Value(loggingType.getName()));
-            // Interval
-            b.setRoConfig("i", new Value(interval));
-
-            final Parameter bft;
-            {
-                bft = new Parameter("Buffer Flush Time", ValueType.NUMBER);
-                {
-                    String desc = "Buffer flush time controls the interval ";
-                    desc += "when data gets written into the database\n";
-                    desc += "Setting a time to 0 means to record data ";
-                    desc += "immediately";
-                    bft.setDescription(desc);
-                }
-                bft.setDefaultValue(new Value(bufferFlushTime));
-            }
-
-            final Parameter lt;
-            {
-                Set<String> enums = LoggingType.buildEnums();
-                lt = new Parameter("Logging Type", ValueType.makeEnum(enums));
-                lt.setDefaultValue(new Value(loggingType.getName()));
-                {
-                    String desc = "Logging type controls what kind of data ";
-                    desc += "gets stored into the database";
-                    lt.setDescription(desc);
-                }
-            }
-
-            final Parameter i;
-            {
-                i = new Parameter("Interval", ValueType.NUMBER);
-                {
-                    String desc = "Interval controls how long to wait before ";
-                    desc += "buffering the next value update.\n";
-                    desc += "This setting has no effect when logging type is ";
-                    desc += "not interval.";
-                    i.setDescription(desc);
-                }
-                i.setDefaultValue(new Value(interval));
-            }
-
-            EditSettingsHandler handler = new EditSettingsHandler();
-            {
-                handler.setBufferFlushTimeParam(bft);
-                handler.setLoggingTypeParam(lt);
-                handler.setIntervalParam(i);
-
-                Action a = new Action(permission, handler);
-                a.addParameter(bft);
-                a.addParameter(lt);
-                a.addParameter(i);
-                handler.setAction(a);
-
-                b.setAction(a);
-            }
-
-            b.build();
-        }
-        {
-            NodeBuilder b = node.createChild("delete");
-            b.setDisplayName("Delete");
-            b.setAction(new Action(permission, new Handler<ActionResult>() {
-                @Override
-                public void handle(ActionResult event) {
-                    Node node = event.getNode().getParent();
-                    node.delete();
-                    unsubscribe();
-                }
-            }));
-            b.build();
-        }
+        createAddWatchAction();
+        createEditAction();
+        createDeleteAction();
+        createRestoreGetHistoryAction();
 
         if (LoggingType.INTERVAL.equals(loggingType)) {
             scheduleWriteToBuffer();
@@ -342,8 +233,130 @@ public class WatchGroup {
         }
     }
 
+    private void createDeleteAction() {
+        NodeBuilder deleteBuilder = node.createChild("delete");
+        deleteBuilder.setDisplayName("Delete");
+        deleteBuilder.setAction(new Action(permission, new Handler<ActionResult>() {
+            @Override
+            public void handle(ActionResult event) {
+                Node node = event.getNode().getParent();
+                unsubscribe();
+                node.delete(false);
+            }
+        }));
+        deleteBuilder.build();
+    }
+
+    private void createEditAction() {
+        NodeBuilder editBuilder = node.createChild("edit");
+        editBuilder.setDisplayName("Edit");
+        // Buffer flush time
+        editBuilder.setRoConfig("bft", new Value(bufferFlushTime));
+        // Logging type
+        editBuilder.setRoConfig("lt", new Value(loggingType.getName()));
+        // Interval
+        editBuilder.setRoConfig("i", new Value(interval));
+
+        final Parameter bufferFlushTime = createBufferFlushTimeParameter();
+        final Parameter loggingTypeParameter = createLoggingTypeParameter();
+        final Parameter intervalParameter = createIntervalParameter();
+        Action editAction = createEditAction(bufferFlushTime, loggingTypeParameter, intervalParameter);
+
+        editBuilder.setAction(editAction);
+        editBuilder.build();
+    }
+
+    private void createAddWatchAction() {
+        NodeBuilder addWatchPathBuilder = node.createChild("addWatchPath");
+        addWatchPathBuilder.setDisplayName("Add Watch Path");
+        Action addWatchPathAction = new Action(permission, new Handler<ActionResult>() {
+            @Override
+            public void handle(ActionResult event) {
+                ValueType valueType = ValueType.STRING;
+                Value pathValue = event.getParameter("Path", valueType);
+                String path = pathValue.getString();
+
+                event.getTable().addColumn(new Parameter("Success", ValueType.BOOL));
+                if (node.hasChild(path)) {
+                    event.getTable().addColumn(new Parameter("Message", ValueType.STRING));
+                    Row make = Row.make(new Value(false),
+                            new Value("Couldn't watch the path " +
+                                    path + " because it is already watched in this Watch Group."));
+                    event.getTable().addRow(make);
+                } else {
+                    initWatch(path, true);
+                    event.getTable().addRow(Row.make(new Value(true)));
+                }
+            }
+        });
+
+        addWatchPathAction.setResultType(ResultType.TABLE);
+
+        Parameter pathParameter = new Parameter("Path", ValueType.STRING);
+        pathParameter.setDescription("Path to start watching for value changes");
+        addWatchPathAction.addParameter(pathParameter);
+
+        addWatchPathBuilder.setAction(addWatchPathAction);
+        addWatchPathBuilder.build();
+    }
+
+    private Action createEditAction(Parameter bufferFlushTime, Parameter loggingTypeParameter, Parameter intervalParameter) {
+        EditSettingsHandler editSettingsHandler = new EditSettingsHandler();
+        Action editAction = new Action(permission, editSettingsHandler);
+        editSettingsHandler.setAction(editAction);
+        editSettingsHandler.setBufferFlushTimeParam(bufferFlushTime);
+        editSettingsHandler.setLoggingTypeParam(loggingTypeParameter);
+        editSettingsHandler.setIntervalParam(intervalParameter);
+
+        editAction.addParameter(bufferFlushTime);
+        editAction.addParameter(loggingTypeParameter);
+        editAction.addParameter(intervalParameter);
+        return editAction;
+    }
+
+    private Parameter createIntervalParameter() {
+        final Parameter intervalParameter = new Parameter("Interval", ValueType.NUMBER);
+        String description = "Interval controls how long to wait before buffering the next value update.\n"
+                + "This setting has no effect when logging type is not interval.";
+        intervalParameter.setDescription(description);
+        intervalParameter.setDefaultValue(new Value(interval));
+        return intervalParameter;
+    }
+
+    private Parameter createLoggingTypeParameter() {
+        Set<String> loggingTypeValues = LoggingType.buildEnums();
+        final Parameter loggingTypeParameter = new Parameter("Logging Type", ValueType.makeEnum(loggingTypeValues));
+        loggingTypeParameter.setDefaultValue(new Value(loggingType.getName()));
+        loggingTypeParameter.setDescription("Logging type controls what kind of data gets stored into the database");
+        return loggingTypeParameter;
+    }
+
+    private Parameter createBufferFlushTimeParameter() {
+        final Parameter bufferFlushTimeParameter = new Parameter("Buffer Flush Time", ValueType.NUMBER);
+        String description = "Buffer flush time controls the interval when data gets written into the database\n"
+                + "Setting a time to 0 means to record data immediately";
+        bufferFlushTimeParameter.setDescription(description);
+        bufferFlushTimeParameter.setDefaultValue(new Value(this.bufferFlushTime));
+        return bufferFlushTimeParameter;
+    }
+
+    private void createRestoreGetHistoryAction() {
+        NodeBuilder nodeBuilder = node.createChild("restoreGetHistoryAction");
+        nodeBuilder.setDisplayName("Restore GetHistory aliases");
+        nodeBuilder.setAction(new Action(permission, new Handler<ActionResult>() {
+            @Override
+            public void handle(ActionResult event) {
+                for (Watch watch : watches) {
+                    watch.addGetHistoryActionAlias();
+                }
+            }
+        }));
+
+        nodeBuilder.build();
+    }
+
     private void useExistingValuesForEditAction() {
-        Node existingEditNode = node.getChild("edit");
+        Node existingEditNode = node.getChild("edit", false);
 
         if (existingEditNode == null) {
             return;
@@ -366,6 +379,10 @@ public class WatchGroup {
     }
 
     private void scheduleBufferFlush() {
+        if (!LoggingType.INTERVAL.equals(loggingType)) {
+            return;
+        }
+
         synchronized (writeLoopLock) {
             if (bufferFut != null) {
                 bufferFut.cancel(false);
@@ -410,6 +427,7 @@ public class WatchGroup {
                 time = value.getTime();
             }
             Watch watch = update.getWatch();
+
             db.write(watch.getPath(), value, time);
             watch.notifyHandlers(new QueryData(value, time));
         }
@@ -419,11 +437,10 @@ public class WatchGroup {
         return !LoggingType.INTERVAL.equals(loggingType);
     }
 
-    public synchronized void addWatchUpdateToBuffer(WatchUpdate watchUpdate) {
+    public synchronized void addWatchUpdateToBuffer(WatchUpdate watchUpdate, Date date) {
+        long withoutMs = ((date.getTime() + 500) / 1000) * 1000;
+        watchUpdate.updateTimestamp(withoutMs);
         queue.add(watchUpdate);
-
-        long nowTimestamp = new Date().getTime();
-        watchUpdate.updateTimestamp(nowTimestamp);
     }
 
     private void cancelBufferWrite() {

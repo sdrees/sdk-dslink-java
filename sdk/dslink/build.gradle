@@ -1,18 +1,8 @@
-apply from: '../build.gradle'
+apply from: '../../bintray.gradle'
+
+description = 'SDK for the IoT DSA protocol'
 
 dependencies {
-    compile project(':internal/logging')
-    compile project(':internal/runtime_shared')
-}
-
-uploadArchives {
-    repositories {
-        mavenDeployer {
-            pom.project {
-                name = 'DSLink SDK'
-                artifactId = 'dslink'
-                description = 'SDK for the IoT DSA protocol'
-            }
-        }
-    }
+    api project(':logging')
+    api project(':runtime_shared')
 }

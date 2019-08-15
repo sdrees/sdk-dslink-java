@@ -1,37 +1,24 @@
+plugins {
+    id 'com.jfrog.bintray' version '1.8.4' apply false
+}
+
 subprojects {
     apply plugin: 'findbugs'
-    apply plugin: 'java'
-    apply plugin: 'idea'
+    apply plugin: 'java-library'
+    apply plugin: 'maven'
 
-    version = '0.16.0-SNAPSHOT'
+    version = '0.22.2'
     sourceCompatibility = 1.7
     targetCompatibility = 1.7
 
     repositories {
-        mavenCentral()
-    }
-
-    configurations {
-        provided
-    }
-
-    idea {
-        module {
-            scopes.PROVIDED.plus += [ configurations.provided ]
-        }
+        mavenLocal()
+        jcenter()
     }
 
     dependencies {
-        provided 'com.google.code.findbugs:annotations:3.0.0'
-        testCompile 'junit:junit:4.12'
-    }
-
-    compileJava {
-        sourceSets.main.compileClasspath += configurations.provided
-    }
-
-    tasks.withType(Javadoc) {
-        classpath += configurations.provided
+        compileOnly 'com.google.code.findbugs:annotations:[3.0.1,)'
+        testImplementation 'junit:junit:[4.12,)'
     }
 
     tasks.withType(FindBugs) {
@@ -41,3 +28,8 @@ subprojects {
         }
     }
 }
+
+wrapper {
+    gradleVersion = '5.5.1'
+}
+

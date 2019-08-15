@@ -109,9 +109,6 @@ public class Action {
         } else if (parameter.getDefault() != null) {
             String err = "Parameter cannot contain a default value in a result";
             throw new IllegalStateException(err);
-        } else if (parameter.getEditorType() != null) {
-            String err = "Parameter cannot contain an editor type";
-            throw new IllegalStateException(err);
         }
         JsonObject result = paramToJson(parameter);
         if (result != null) {
@@ -131,6 +128,19 @@ public class Action {
             addParameter(p);
         }
         postParamsUpdate();
+    }
+
+    /**
+     * Clears the existing columns and adds the new columns.
+     *
+     * @param newColumns Columns to set.
+     */
+    public void setColumns(Collection<Parameter> newColumns) {
+        this.results = new JsonArray();
+        for (Parameter p : newColumns) {
+            addResult(p);
+        }
+        postColumnsUpdate();
     }
 
     public void setSubscriptionManager(Node node,
@@ -204,6 +214,16 @@ public class Action {
     }
 
     /**
+     * Posts a columns update.
+     */
+    protected final void postColumnsUpdate() {
+        if (node != null && manager != null) {
+            Value v = new Value(getColumns());
+            manager.postMetaUpdate(node, "$columns", v);
+        }
+    }
+
+    /**
      * Converts all the parameters to JSON consumable format.
      *
      * @param param Parameter to convert.
@@ -223,6 +243,9 @@ public class Action {
         EditorType type = param.getEditorType();
         if (type != null) {
             obj.put("editor", type.toJsonString());
+            if (type.getMeta() != null) {
+                obj.put("editorMeta", type.getMeta());
+            }
         }
 
         String description = param.getDescription();

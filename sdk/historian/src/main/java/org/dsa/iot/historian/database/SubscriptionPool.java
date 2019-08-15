@@ -20,6 +20,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  */
 public class SubscriptionPool {
 
+    private static final int QOS = 1;
     private final Map<String, SubHandler> subscriptions = new HashMap<>();
     private final Requester requester;
 
@@ -33,7 +34,7 @@ public class SubscriptionPool {
             handler = new SubHandler();
             subscriptions.put(path, handler);
             handler.addWatch(watch);
-            requester.subscribe(new SubData(path, 1), handler);
+            requester.subscribe(new SubData(path, QOS), handler);
         } else {
             handler.addWatch(watch);
         }
@@ -46,13 +47,9 @@ public class SubscriptionPool {
             if (handler.isEmpty()) {
                 String getHistoryActionAliasPath = path + "/@@getHistory";
 
-                // Need to ensure to be subscribed so the graph icon disappears in DGLux
-                requester.subscribe(getHistoryActionAliasPath, null);
-
+                requester.unsubscribe(path, handler, null);
                 requester.remove(new RemoveRequest(getHistoryActionAliasPath), null);
                 subscriptions.remove(path);
-
-                requester.unsubscribe(path, null);
             }
         }
     }
@@ -98,7 +95,15 @@ public class SubscriptionPool {
                 if (val == null) {
                     return;
                 }
-                val.setTime(System.currentTimeMillis());
+                try {
+                    if ((val.getTime() < 0) && !val.isImmutable()) {
+                        val.setTime(System.currentTimeMillis());
+                    }
+                } catch (Exception x) {
+                    //Just in case there are parsing errors because of wacky
+                    //timestamp formatting.
+                    val.setTime(System.currentTimeMillis());
+                }
                 for (Watch w : watches) {
                     w.onData(event);
                 }

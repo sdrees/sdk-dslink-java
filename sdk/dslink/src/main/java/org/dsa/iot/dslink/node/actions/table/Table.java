@@ -1,6 +1,9 @@
 package org.dsa.iot.dslink.node.actions.table;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import java.util.Collections;
+import java.util.LinkedList;
+import java.util.List;
 import org.dsa.iot.dslink.connection.DataHandler;
 import org.dsa.iot.dslink.link.Responder;
 import org.dsa.iot.dslink.methods.StreamState;
@@ -10,21 +13,18 @@ import org.dsa.iot.dslink.util.handler.Handler;
 import org.dsa.iot.dslink.util.json.JsonArray;
 import org.dsa.iot.dslink.util.json.JsonObject;
 
-import java.util.Collections;
-import java.util.LinkedList;
-import java.util.List;
-
 /**
  * Constructs a table for action results. This class is not thread safe.
  *
  * @author Samuel Grenier
  */
-@SuppressFBWarnings("IS2_INCONSISTENT_SYNC")    
+@SuppressFBWarnings("IS2_INCONSISTENT_SYNC")
 public class Table {
 
     private List<Parameter> columns;
     private List<Row> rows;
     private Mode mode;
+    private Modify modify;
     private JsonObject meta;
     private boolean ready;
 
@@ -60,7 +60,7 @@ public class Table {
     /**
      * Batch metadata is ignored if the table is not streaming.
      *
-     * @param cols Columns to dynamically adjust columns of the table.
+     * @param cols  Columns to dynamically adjust columns of the table.
      * @param batch Batch of rows.
      */
     public synchronized void addBatchRows(List<Parameter> cols, BatchRow batch) {
@@ -105,7 +105,7 @@ public class Table {
      * the requester.
      *
      * @param cols Columns to dynamically adjust columns of the table.
-     * @param row Row to add to the table.
+     * @param row  Row to add to the table.
      */
     public synchronized void addRow(List<Parameter> cols, Row row) {
         DataHandler writer = this.writer;
@@ -151,9 +151,9 @@ public class Table {
      * Used to set the table to streaming mode. This is called automatically
      * for any tables that keep their stream open.
      *
-     * @param rid Request ID
-     * @param writer Writer endpoint
-     * @param responder Responder that holds the stream
+     * @param rid          Request ID
+     * @param writer       Writer endpoint
+     * @param responder    Responder that holds the stream
      * @param closeHandler Close handler
      */
     public synchronized void setStreaming(int rid,
@@ -170,6 +170,7 @@ public class Table {
         rows = null;
         columns = null;
         mode = null;
+        modify = null;
         //Wake up anyone waiting for a stream
         if (streamMutex != null) {
             synchronized (streamMutex) {
@@ -183,23 +184,25 @@ public class Table {
 
     /**
      * Returns as soon as stream is established or the wait has expired.
+     *
      * @param millis How long to wait for a stream, &lt;= 0 means wait forever
-     * and is discouraged.
+     *               and is discouraged.
      * @return True if the stream is established.
      */
     public boolean waitForStream(long millis) {
-        return waitForStream(millis,false);
+        return waitForStream(millis, false);
     }
 
-        /**
-        * Returns as soon as stream is established or the wait has expired.
-        * @param millis How long to wait for a stream, &lt;= 0 means wait forever
-        * and is discouraged.
-        * @param throwException If true, and a stream is not acquired, this will
-        * throw an IllegalStateException.
-        * @return True if the stream is established.
-        */
-    @SuppressFBWarnings("WA_NOT_IN_LOOP")    
+    /**
+     * Returns as soon as stream is established or the wait has expired.
+     *
+     * @param millis         How long to wait for a stream, &lt;= 0 means wait forever
+     *                       and is discouraged.
+     * @param throwException If true, and a stream is not acquired, this will
+     *                       throw an IllegalStateException.
+     * @return True if the stream is established.
+     */
+    @SuppressFBWarnings("WA_NOT_IN_LOOP")
     public boolean waitForStream(long millis, boolean throwException) {
         Object mutex = null;
         synchronized (this) {
@@ -216,11 +219,11 @@ public class Table {
                 try {
                     if (millis <= 0) {
                         mutex.wait();
-                    }
-                    else {
+                    } else {
                         mutex.wait(millis);
                     }
-                } catch (Exception ignorable) {}
+                } catch (Exception ignorable) {
+                }
             }
             if (writer == null) {
                 if (throwException) {
@@ -242,7 +245,7 @@ public class Table {
             JsonObject obj = new JsonObject();
             obj.put("rid", rid);
             obj.put("stream", StreamState.CLOSED.getJsonName());
-            writer.writeResponse(obj);
+            writer.writeResponse(obj, false);
             this.writer = null;
             Handler<Void> closeHandler = this.closeHandler;
             if (closeHandler != null) {
@@ -266,6 +269,7 @@ public class Table {
         this.columns = null;
         this.rows = null;
         this.mode = null;
+        this.modify = null;
         this.closeHandler = null;
         this.meta = null;
         this.responder = null;
@@ -288,7 +292,22 @@ public class Table {
     }
 
     /**
+     * @return "modify" metadata field
+     */
+    public synchronized Modify getModify() {
+        return modify;
+    }
+
+    /**
+     * Sets the modify field of the table.
      *
+     * @param modify Modify type to set.
+     */
+    public synchronized void setModify(Modify modify) {
+        this.modify = modify;
+    }
+
+    /**
      * @return Columns of the table.
      */
     public synchronized List<Parameter> getColumns() {
@@ -316,7 +335,6 @@ public class Table {
     }
 
     /**
-     *
      * @param copy Whether to copy all the rows into a new list.
      * @return Rows of the table.
      */
@@ -336,7 +354,7 @@ public class Table {
         JsonObject obj = new JsonObject();
         obj.put("rid", rid);
         obj.put("stream", StreamState.OPEN.getJsonName());
-        writer.writeResponse(obj);
+        writer.writeResponse(obj, false);
     }
 
     private void write(DataHandler writer,
@@ -361,7 +379,7 @@ public class Table {
         if (updates != null) {
             obj.put("updates", updates);
         }
-        writer.writeResponse(obj,false);
+        writer.writeResponse(obj, false);
     }
 
     private JsonArray processRow(Row row) {

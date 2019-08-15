@@ -1,11 +1,7 @@
 package org.dsa.iot.dslink.node.value;
 
-import org.dsa.iot.dslink.util.StringUtils;
-
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
+import org.dsa.iot.dslink.util.*;
+import java.util.*;
 
 /**
  * Type of the value
@@ -16,6 +12,7 @@ import java.util.Collections;
 public final class ValueType {
 
     public static final String JSON_NUMBER = "number";
+    public static final String JSON_INT = "int";
     public static final String JSON_STRING = "string";
     public static final String JSON_BOOL = "bool";
     public static final String JSON_MAP = "map";
@@ -109,8 +106,13 @@ public final class ValueType {
      * @return Converted type
      */
     public static ValueType toValueType(String type) {
+        if (type == null) {
+            return ValueType.DYNAMIC;
+        }
+
         switch (type) {
             case JSON_NUMBER:
+            case JSON_INT:
                 return NUMBER;
             case JSON_STRING:
                 return STRING;
@@ -134,10 +136,23 @@ public final class ValueType {
                 } else if (type.startsWith(JSON_ENUM + "[") && type.endsWith("]")) {
                     type = type.substring(JSON_ENUM.length() + 1);
                     type = type.substring(0, type.length() - 1);
-                    String[] split = type.split(",");
+                    String[] split = StringUtils.split(type, true, ",");
                     return new ValueType(Arrays.asList(split));
                 }
-                throw new RuntimeException("Unknown type: " + type);
+                return DYNAMIC;
         }
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        if (other instanceof ValueType) {
+            return ((ValueType) other).toJsonString().equals(toJsonString());
+        }
+        return false;
+    }
+
+    @Override
+    public int hashCode() {
+        return 37 * toJsonString().hashCode();
     }
 }

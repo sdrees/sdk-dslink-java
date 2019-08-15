@@ -1,17 +1,15 @@
 package org.dsa.iot.dslink.serializer;
 
-import org.dsa.iot.dslink.node.NodeManager;
-import org.dsa.iot.dslink.provider.LoopProvider;
-import org.dsa.iot.dslink.util.FileUtils;
-import org.dsa.iot.dslink.util.json.JsonObject;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.io.File;
-import java.io.IOException;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+import org.dsa.iot.dslink.node.*;
+import org.dsa.iot.dslink.provider.*;
+import org.dsa.iot.dslink.util.*;
+import org.dsa.iot.dslink.util.json.*;
+import org.slf4j.*;
+import java.io.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import javax.crypto.*;
+import javax.crypto.spec.*;
 
 /**
  * Handles automatic serialization and deserialization.
@@ -29,19 +27,23 @@ public class SerializationManager {
     private final Serializer serializer;
     private ScheduledFuture<?> future;
 
+    private SecretKeySpec secretKeySpec;
+    private static final String PASSWORD_PREFIX = "\u001Bpw:";
+    static final String PASSWORD_TOKEN = "assword";
+
     private final AtomicBoolean changed = new AtomicBoolean(false);
 
     /**
      * Handles serialization based on the file path.
      *
-     * @param file Path that holds the data
+     * @param file    Path that holds the data
      * @param manager Manager to deserialize/serialize
      */
     public SerializationManager(File file, NodeManager manager) {
         this.file = file;
         this.backup = new File(file.getPath() + ".bak");
-        this.deserializer = new Deserializer(manager);
-        this.serializer = new Serializer(manager);
+        this.deserializer = new Deserializer(this, manager);
+        this.serializer = new Serializer(this, manager);
     }
 
     public void markChanged() {
@@ -78,26 +80,66 @@ public class SerializationManager {
      * handle serialization.
      */
     public void serialize() {
-        JsonObject json = serializer.serialize();
         try {
-            if (file.exists()) {
-                if (backup.exists() && !backup.delete()) {
-                    LOGGER.error("Failed to remove backup data");
+            JsonObject json = serializer.serialize();
+            //Save the config db to a temp file.  If we can't do that, then we don't
+            //want to do anything else.
+            File tmp = new File(file.getParent(), file.getName() + ".tmp");
+            if (tmp.exists()) {
+                if (!tmp.delete()) {
+                    throw new IOException("Could not delete " + tmp.getName());
                 }
-
-                if (!file.renameTo(backup)) {
-                    LOGGER.error("Failed to create backup data");
-                }
-                LOGGER.debug("Copying serialized data to a backup");
             }
-            byte[] bytes = json.encodePrettily();
-            FileUtils.write(file, bytes);
-
+            FileUtils.write(tmp, json.encodePrettily());
+            if (!tmp.exists()) {
+                throw new IOException(
+                        tmp.getName() + " weirdly did not exist after writing to it");
+            }
+            if (tmp.length() == 0) {
+                throw new IOException(tmp.getName() + " serialized to a file size of 0");
+            }
+            //Now backup the last version
+            if (file.exists()) {
+                if (backup.exists()) {
+                    if (!backup.delete()) {
+                        throw new IOException(
+                                "Could not delete old " + backup.getName());
+                    }
+                }
+                LOGGER.debug("Making backup");
+                if (!file.renameTo(backup)) {
+                    FileUtils.copy(file, backup); //try really hard
+                }
+                if (!backup.exists()) {
+                    throw new IllegalStateException(
+                            "Unable to make backup " + backup.getName());
+                }
+                if (file.exists()) {
+                    if (!file.delete()) {
+                        throw new IOException("Could not delete old " + file.getName());
+                    }
+                }
+            }
+            //Move the new tmp database into position.
+            if (!tmp.renameTo(file)) {
+                FileUtils.copy(tmp, file); //try really hard
+            }
+            if (!file.exists()) {
+                //This will keep the tmp file in place, although the next serialization
+                //attempt will probably delete it
+                throw new IOException(
+                        "Failed to move " + tmp.getName() + " to " + file.getName());
+            }
+            if (tmp.exists()) {
+                if (!tmp.delete()) {
+                    LOGGER.warn("Unable to delete old tmp file " + tmp.getName());
+                }
+            }
             if (LOGGER.isDebugEnabled()) {
-                LOGGER.debug("Wrote serialized data: {}", json);
+                LOGGER.debug("Backup complete");
             }
         } catch (IOException e) {
-            LOGGER.error("Failed to save serialized data", e);
+            LOGGER.error("Failed to save configuration database", e);
         }
     }
 
@@ -107,55 +149,116 @@ public class SerializationManager {
      * @throws Exception An error has occurred deserializing the nodes.
      */
     public void deserialize() throws Exception {
-        deserialize(true);
-    }
-
-    private void deserialize(boolean cont) throws Exception {
-        byte[] bytes = null;
         if (file.exists()) {
             try {
-                bytes = FileUtils.readAllBytes(file);
-            } catch (Exception ignored) {
+                handle(FileUtils.readAllBytes(file));
+                LOGGER.debug("Restored " + file.getName());
+                return;
+            } catch (Exception x) {
+                LOGGER.error("Could not deserialize " + file.getName(), x);
             }
-        } else if (backup.exists()) {
-            bytes = FileUtils.readAllBytes(backup);
-            FileUtils.write(file, bytes);
-            LOGGER.warn("Restored backup data");
         }
-
-        boolean tryAgain = false;
-        if (bytes != null) {
+        //There was a problem with the primary db.
+        if (backup.exists()) {
             try {
-                handle(bytes);
-            } catch (Exception e) {
-                if (!cont) {
-                    throw e;
+                handle(FileUtils.readAllBytes(backup));
+                LOGGER.warn("Restored backup " + backup.getName());
+                if (file.exists()) {
+                    //Try delete the primary db so it won't overwrite the
+                    //good backup during the next serialization
+                    if (!file.delete()) {
+                        LOGGER.warn("Unable to delete corrupt " + file.getName());
+                    }
                 }
-                tryAgain = true;
+                return;
+            } catch (Exception x) {
+                LOGGER.error("Could not delete " + file.getName(), x);
             }
-        } else {
-            tryAgain = true;
         }
-
-        if (tryAgain && cont) {
-            // Force reading from the backup
-            if (!file.delete()) {
-                LOGGER.debug("Failed to delete original file");
+        //We've got nothing to lose, try the tmp serialization file
+        File tmp = new File(file.getParent(), file.getName() + ".tmp");
+        if (tmp.exists()) {
+            try {
+                handle(FileUtils.readAllBytes(tmp));
+                LOGGER.warn("Restored " + tmp.getName());
+                return;
+            } catch (Exception x) {
+                LOGGER.error("Could not deserialize " + tmp.getName(), x);
             }
-            deserialize(false);
         }
+        LOGGER.warn("Unable to deserialize a configuration database");
     }
 
     private void handle(byte[] bytes) throws Exception {
         String in = new String(bytes, "UTF-8");
         JsonObject obj = new JsonObject(in);
-        if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("Read serialized data: " + obj);
-        }
         deserializer.deserialize(obj);
+    }
+
+    /**
+     * Decrypts passwords that were encrypted by the encrypt method.  This is backwards
+     * compatible with older unencrypted passwords.
+     *
+     * @param pass Base64 encoding of the password to decrypt, can be encrypted or
+     *             unencrypted.
+     * @return An unencrypted password.
+     */
+    synchronized String decrypt(Node node, String pass) {
+        try {
+            if (pass.startsWith(PASSWORD_PREFIX)) {
+                byte[] bytes = UrlBase64.decode(pass.substring(PASSWORD_PREFIX.length()));
+                bytes = applyCipher(bytes, node, Cipher.DECRYPT_MODE);
+                pass = new String(bytes, "UTF-8");
+            }
+        } catch (Exception x) {
+            throw new RuntimeException(x);
+        }
+        return pass;
+    }
+
+    /**
+     * Encrypts passwords using characters from the private key of the link as
+     * the secret key.
+     *
+     * @param pass Unencrypted password.
+     * @return Base64 encoding of the encrypted password.
+     */
+    synchronized String encrypt(Node node, String pass) {
+        try {
+            byte[] bytes = pass.getBytes("UTF-8");
+            bytes = applyCipher(bytes, node, Cipher.ENCRYPT_MODE);
+            return PASSWORD_PREFIX + UrlBase64.encode(bytes);
+        } catch (Exception x) {
+            throw new RuntimeException(x);
+        }
+    }
+
+    /**
+     * Encrypts or decrypts the given password.
+     *
+     * @param password   The password to encrypt or decrypt.
+     * @param node       Used to get the private key of the link.
+     * @param cipherMode Cipher.ENCRYPT_MODE or Cipher.DECRYPT_MODE
+     * @return The transformed password.
+     */
+    private byte[] applyCipher(byte[] password, Node node, int cipherMode)
+            throws Exception {
+        final String ALGO = "AES";
+        if (secretKeySpec == null) {
+            byte[] privateKey = node.getLink().getHandler()
+                    .getConfig().getKeys().getPrivateKey().getEncoded();
+            final int KEY_LEN = 16;
+            byte[] key = new byte[KEY_LEN];
+            System.arraycopy(privateKey, privateKey.length - KEY_LEN, key, 0, KEY_LEN);
+            secretKeySpec = new SecretKeySpec(key, ALGO);
+        }
+        Cipher cipher = Cipher.getInstance(ALGO);
+        cipher.init(cipherMode, secretKeySpec);
+        return cipher.doFinal(password);
     }
 
     static {
         LOGGER = LoggerFactory.getLogger(SerializationManager.class);
     }
+
 }
